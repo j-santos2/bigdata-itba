@@ -120,7 +120,7 @@ Esta tabla agrega las transacciones por díe en el que sucedieron, el país, la 
 
 ## Preguntas de análisis y comprensión
 
-1. Ambos batch (002 y 003) recibieron 204 filas físicas.
+1. Ambos batch (002 y 003) recibieron 204 filas físicas que son todas las filas que contienen cada uno de los archivos csv generados por *00_generate_new_batch.ipynb*.
 ```
 SELECT
   `source_batch_id`,
@@ -131,7 +131,7 @@ GROUP BY
   `source_batch_id`
 ```
 
-2. 2 rechazados en batch_002 y batch_003, y 51 en initial. Si se corresponde.
+2. 2 rechazados en batch_002 y batch_003, y 51 en initial. Si se corresponde, ya que hay un *amount* inválido y un *customer* desconocido que se introduce por cada batch que se genera y la tabla agregada de *gold* confirma los resultados.
 ```
 SELECT
   `source_batch_id`,
@@ -151,7 +151,7 @@ FROM
   `workspace`.`bigdata_alumno99`.`gold_batch_summary`
 ```
 
-3. Se corresponden, se genera un duplicado, un amount inválido y un cliente desconocido por batch:
+3. Se corresponden, se genera un duplicado, un amount inválido y un cliente desconocido por batch dentro del archivo *generate_incremental_data.py*. Esto confirma nuevamente los resultados del punto anterior:
 
 ```
 SELECT
@@ -197,7 +197,7 @@ unknown_customer.update(
 rows.append(unknown_customer)
 ```
 
-4. En `bronze_transactions_all` existen 3 registros para la transacción 42. La más reciente, dada por `updated_at` que pertenece al `batch_003`, es la que se encuentra en `silver_transactions`.
+4. En `bronze_transactions_all` existen 3 registros para la transacción 42. La más reciente, dada por `updated_at` que pertenece al `batch_003`, es la que se encuentra en `silver_transactions` ya que la condición del *MERGE* determina que se trata de la misma transacción y la más versión reciente debe ser la que se refleja en *silver*.
 
 ```
 
@@ -283,7 +283,7 @@ FROM base_transactions
 ORDER BY acc_rate DESC;
 ```
 
-7. El día de mayor monto total y mayor cantidad de transacciones coincide y es el *03-01-2020*.
+7. El día de mayor monto total y mayor cantidad de transacciones coincide y es el *2026-03-01*, con un monto total de *7310840.77* y *7236* transacciones.
 
 ```
 SELECT 
@@ -344,23 +344,30 @@ ORDER BY total_amount DESC;
 10.  Las métricas comparadas para evaluar idempotencia si el último batch id es igual al expected son las siguientes: `(prior.silver_rows, prior.quarantine_rows, prior.gold_rows, prior.gold_total_amount)`. 
 En la columna *idempotence_compared* de *pipeline_run_audit* se guarda si es que se realizó la comparación de idempotencia.
 
-11. Para evitar cargar el mismo archivo múltiples veces, `COPY INTO` utiliza los nombres de los archivos.
+11. Para evitar cargar el mismo archivo múltiples veces ya que se supone que el contenido de los archivos ya procesados se encuentra en *bronze*. [`COPY INTO`](https://docs.databricks.com/aws/en/sql/language-manual/delta-copy-into) utiliza los nombres de los archivos así que incluso si se hubiese modificado el archivo, no se volverá a cargar.
 
 12. Porque esta vista lee y guarda todos los registros (append-only), usar *UNION ALL* no es costoso computacionalmente y esta capa se supone que debe tener todos los registros para no perder trazabilidad. Luego se resuelven los duplicados (y se limpian los datos) para la capa silver, en este caso utilizando el más reciente basado en *updated_at*, para escribirlos en *silver_transactions*. 
 
-13. Utilizan *event_ts* como *updated_at* ya que se supone que es cuando el dato se originó y correciones tendrán timestamps posteriores.
+13. Utilizan *event_ts* como *updated_at* ya que se supone que es cuando el dato se originó y correciones tendrán timestamps posteriores. De esta manera cualquier correción que se haga sobre el dato podrá ser detectada y aplicada fácilmente por *MERGE INTO*.
+La transacción 42 fue corregida dos veces: primero en el batch 002 y después en el 003. Los valores de *updated_at* corresponden a timestamps posteriores, y aunque no siempre es así para el *event_ts* ni es relevante, en este caso también lo son.
 
-14. La ventaja del *try_cast* es que intenta realizar la transformación a otro tipo, pero si falla retorna *NULL* en lugar de un error.
+14. La ventaja del *try_cast* es que intenta realizar la transformación a otro tipo, pero si falla retorna *NULL* en lugar de un error. Esto se hace para que el pipeline no termine abruptamente con un error que es lo que sucedería con un *cast*.
 
-15. Es importante el orden de las condiciones ya que si hubiera más de una de las reglas que se rompe, al evaluarse todas solo queda como causa la primera de ellas que se rompa. (El primer caso *WHEN* evaluado como verdadero en *quality_rules*)
+15. Es importante el orden de las condiciones ya que si hubiera más de una de las reglas que se rompe, al evaluarse todas solo queda como causa la primera de ellas que se rompa. (El primer caso *WHEN* evaluado como verdadero en *quality_rules*) Esto sucede ya que *WHEN* evalúa casos secuencialmente hasta que uno de ellos se cumpla, asigna el valor en este caso y no evalúa el resto.
 
-16. El record_key intenta usar el *transaction_id_typed* como String si no es nulo, si fuese nulo concatena las columas (reemplazando nulos) y aplica una función de hash.
+16. El record_key intenta usar el *transaction_id_typed* como String si no es nulo, si fuese nulo concatena las columas (reemplazando nulos) y aplica una función de hash ya que al carecer de un identificador único debemos crear uno. Esta es una manera de crearlo a partir de los datos compatible, sencilla y reproducible. Si llegase un registro exáctamente igual aparte de representar aparentemente lo mismo, aplicar la misma función devuelve el mismo resultado.
 
-17. Se actualiza una fila existente cuando se encuentra el mismo *transaction_id*, y se inserta como nuevo cuando está ausente.
+17. Se actualiza una fila existente cuando se encuentra el mismo *transaction_id*, y se inserta como nuevo cuando está ausente. La condición evaluada para decidir si actualizar los valores una vez que hay coincide el id es si el campo updated_at tiene un timestamp más reciente.
+
+```
+MERGE INTO {transactions} t USING _valid_transactions s ON t.transaction_id = s.transaction_id
+WHEN MATCHED AND s.updated_at > t.updated_at THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+```
 
 18. La tabla silver se actualiza ya que en ella se corrigen errores y contiene todos los registros (limpios y deduplicados). En cambio las tablas gold están agregadas y contienen KPIs por lo que un cambio particular cambia el contenido ya que debe ser recalculado.
 Una ventaja es que solo se procesan y escriben datos que cambiaron o son nuevos en silver y en gold los datos son siempre consistentes con las reglas de negocio. Como desventaja, a medida que incrementa el volumen historico se requieren más recursos para recalcular gold.
 
 19. *expected_batch_id* no participa en la detección de nuevos archivos ya que de eso se encarga *COPY INTO*. Este parametro se utiliza para verificar que en la tabla incremental se encuentra el batch que uno esperaba procesar. Es decir que es unicamente una validación en la capa de bronce que valida que el batch llego y luego también forma parte de las validaciones generales en *04_validate_pipeline*.
 
-20. Si un run falla en alguna etapa, el resto no continúa como por ejemplo mi primer ejecución en la que el parametro *batch_id* tenía un valor incorrecto.
+20. Si un run falla en alguna etapa, el resto no continúa como por ejemplo mi primer ejecución en la que el parametro *batch_id* tenía un valor incorrecto. El DAG construido tiene 4 etapas, bronze, silver, gold y validation, ejecutadas de manera secuencial en el mismo orden ya que los resultados de una son usados como entrada en la siguiente. Fallar en cualquiera de ellas provoca que no se continúe con los pasos posteriores. De esta manera, si hay algún error en una capa inicial no es necesario crear las tablas gold con valores incompletos/erróneos y mucho menos validar que estos sean correctos.
